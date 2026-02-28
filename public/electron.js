@@ -11,22 +11,16 @@ const yargsParser = require('yargs-parser');
 
 const Instauto = require('instauto');
 const moment = require('moment');
-const electronRemote = require('@electron/remote/main'); // todo migrate away from this
+const electronRemote = require('@electron/remote/main');
 
-
-// Keep a global reference of the window object, if you don't, the window will
-// be closed automatically when the JavaScript object is garbage collected.
 let mainWindow;
-
 let instautoDb;
 let instauto;
 let instautoWindow;
 let logger = console;
-
 let powerSaveBlockerId;
 
 // Must be called before electron is ready
-// NOTE: It will listen to a TCP port. could be an issue
 const pieConnectPromise = (async () => {
   await pie.initialize(app);
   return pie.connect(app, puppeteer);
@@ -38,10 +32,7 @@ electronRemote.initialize();
 
 function parseCliArgs() {
   const ignoreFirstArgs = isDev ? 2 : 1;
-  // production: First arg is the app executable
-  // dev: First 2 args are electron and the electron.js
   const argsWithoutAppName = process.argv.length > ignoreFirstArgs ? process.argv.slice(ignoreFirstArgs) : [];
-
   return yargsParser(argsWithoutAppName);
 }
 
@@ -51,7 +42,6 @@ const { root: customRootPath } = args;
 
 if (customRootPath) {
   console.log('Using custom root', customRootPath);
-  // must happen before 'ready' event
   app.setPath('userData', join(customRootPath, 'electron'));
 }
 
@@ -69,21 +59,20 @@ async function deleteCookies() {
   try {
     await fs.unlink(cookiesPath);
   } catch (err) {
-    logger.log('No cookies to delete', err);
+    logger.log('No cookies to delete', err.message);
   }
 }
 
 async function initInstautoDb(usernameIn) {
   const username = usernameIn && filenamify(usernameIn);
-  const followedDbPath = getFilePath(username ? `${username}-followed.json` : 'followed.json');
-  const unfollowedDbPath = getFilePath(username ? `${username}-unfollowed.json` : 'followed.json');
-  const likedPhotosDbPath = getFilePath(username ? `${username}-liked-photos.json` : 'followed.json');
+  const followedDbPath    = getFilePath(username ? `${username}-followed.json`    : 'followed.json');
+  const unfollowedDbPath  = getFilePath(username ? `${username}-unfollowed.json`  : 'unfollowed.json');
+  const likedPhotosDbPath = getFilePath(username ? `${username}-liked-photos.json`: 'liked-photos.json');
 
-  // Migrate any old paths if we have new version (with username) now:
   if (username) {
-    await fs.move(getFilePath('followed.json'), followedDbPath).catch(() => {});
-    await fs.move(getFilePath('unfollowed.json'), unfollowedDbPath).catch(() => {});
-    await fs.move(getFilePath('liked-photos.json'), likedPhotosDbPath).catch(() => {});
+    await fs.move(getFilePath('followed.json'),      followedDbPath).catch(() => {});
+    await fs.move(getFilePath('unfollowed.json'),    unfollowedDbPath).catch(() => {});
+    await fs.move(getFilePath('liked-photos.json'),  likedPhotosDbPath).catch(() => {});
   }
 
   instautoDb = await Instauto.JSONDB({
@@ -95,17 +84,131 @@ async function initInstautoDb(usernameIn) {
 
 function getInstautoData() {
   const dayMs = 24 * 60 * 60 * 1000;
-
   if (!instautoDb) return undefined;
-
   return {
-    numTotalFollowedUsers: instautoDb.getTotalFollowedUsers(),
+    numTotalFollowedUsers:   instautoDb.getTotalFollowedUsers(),
     numTotalUnfollowedUsers: instautoDb.getTotalUnfollowedUsers(),
-    numFollowedLastDay: instautoDb.getFollowedLastTimeUnit(dayMs).length,
-    numUnfollowedLastDay: instautoDb.getUnfollowedLastTimeUnit(dayMs).length,
-    numTotalLikedPhotos: instautoDb.getTotalLikedPhotos(),
-    numLikedLastDay: instautoDb.getLikedPhotosLastTimeUnit(dayMs).length,
+    numFollowedLastDay:      instautoDb.getFollowedLastTimeUnit(dayMs).length,
+    numUnfollowedLastDay:    instautoDb.getUnfollowedLastTimeUnit(dayMs).length,
+    numTotalLikedPhotos:     instautoDb.getTotalLikedPhotos(),
+    numLikedLastDay:         instautoDb.getLikedPhotosLastTimeUnit(dayMs).length,
   };
+}
+
+// ── Instagram login page fix ───────────────────────────────────────────────────
+// Instagram changed their login page. This helper is invoked after Instauto
+// Espera a que aparezca el primer selector que exista, con timeout
+async function waitForAnySelector(page, selectors, timeout = 15000) {
+  const found = await Promise.race(
+    selectors.map(sel =>
+      page.waitForSelector(sel, { timeout, visible: true })
+        .then(() => sel)
+        .catch(() => null)
+    )
+  );
+  return found; // devuelve el selector que apareció primero, o null
+}
+
+// Maneja el flujo de login de Instagram:
+//   • Espera a que React renderice el formulario (usa waitForSelector)
+//   • Descarta banners de cookies (EU y global)
+//   • Rellena usuario y contraseña
+//   • Descarta popups post-login
+async function handleInstagramLoginPage(page, username, password) {
+  const currentUrl = page.url();
+  if (!currentUrl.includes('instagram.com') || currentUrl.includes('challenge')) return;
+
+  try {
+    console.log('[Login] Iniciando flujo de login en', currentUrl);
+
+    // 1. Navegar directamente a la página de login si no estamos ya ahí
+    if (!currentUrl.includes('/accounts/login')) {
+      console.log('[Login] Navegando a /accounts/login/');
+      await page.goto('https://www.instagram.com/accounts/login/', {
+        waitUntil: 'networkidle2',
+        timeout: 30000,
+      }).catch(() => {}); // si falla la espera de networkidle2, continuar
+    }
+
+    // 2. Esperar a que el DOM de React monte los inputs (hasta 20 segundos)
+    const USERNAME_SELECTORS = [
+      'input[name="username"]',
+      'input[aria-label="Phone number, username, or email"]',
+      'input[aria-label="Nombre de usuario, teléfono o correo electrónico"]',
+      'input[autocomplete="username"]',
+      'input[type="text"]',
+    ];
+
+    console.log('[Login] Esperando que aparezca el campo usuario…');
+    const foundUserSel = await waitForAnySelector(page, USERNAME_SELECTORS, 20000);
+
+    if (!foundUserSel) {
+      console.warn('[Login] No se encontró el campo de usuario. Puede haber un captcha o bloqueo.');
+      return;
+    }
+    console.log('[Login] Campo usuario encontrado con selector:', foundUserSel);
+
+    // 3. Descartar banner de cookies si aparece
+    await page.evaluate(() => {
+      const keywords = ['Allow all', 'Accept all', 'Aceptar todo', 'Allow essential', 'Decline optional'];
+      const btn = Array.from(document.querySelectorAll('button'))
+        .find(b => keywords.some(k => b.textContent.trim().startsWith(k)));
+      if (btn) btn.click();
+
+      const testIdBtn = document.querySelector('[data-testid="cookie-policy-manage-dialog-accept-button"]');
+      if (testIdBtn) testIdBtn.click();
+    }).catch(() => {});
+
+    await new Promise(r => setTimeout(r, 600));
+
+    // 4. Rellenar usuario
+    const usernameField = await page.$(foundUserSel);
+    if (usernameField) {
+      await usernameField.click({ clickCount: 3 });
+      await usernameField.type(username, { delay: 60 + Math.random() * 60 });
+      console.log('[Login] Usuario escrito');
+    }
+
+    // 5. Rellenar contraseña
+    const PASSWORD_SELECTORS = [
+      'input[name="password"]',
+      'input[aria-label="Password"]',
+      'input[aria-label="Contraseña"]',
+      'input[autocomplete="current-password"]',
+      'input[type="password"]',
+    ];
+
+    const foundPassSel = await waitForAnySelector(page, PASSWORD_SELECTORS, 8000);
+    if (foundPassSel) {
+      const passwordField = await page.$(foundPassSel);
+      if (passwordField) {
+        await passwordField.click({ clickCount: 3 });
+        await passwordField.type(password, { delay: 60 + Math.random() * 60 });
+        console.log('[Login] Contraseña escrita');
+      }
+    } else {
+      console.warn('[Login] No se encontró el campo de contraseña');
+    }
+
+    // 6. Enviar
+    await page.keyboard.press('Enter');
+    console.log('[Login] Formulario enviado, esperando respuesta…');
+    await new Promise(r => setTimeout(r, 4000));
+
+    // 7. Descartar "Save your login info?" y "Turn on Notifications?"
+    for (let i = 0; i < 2; i++) {
+      await page.evaluate(() => {
+        const btn = Array.from(document.querySelectorAll('button'))
+          .find(b => /not now|ahora no/i.test(b.textContent));
+        if (btn) btn.click();
+      }).catch(() => {});
+      await new Promise(r => setTimeout(r, 1200));
+    }
+
+    console.log('[Login] Flujo de login completado');
+  } catch (err) {
+    console.warn('[Login] Error no-fatal:', err.message);
+  }
 }
 
 async function initInstauto({
@@ -130,33 +233,69 @@ async function initInstauto({
     x: 0,
     y: 0,
     webPreferences: {
-      partition: 'instauto', // So that we have a separate session
+      partition: 'instauto',
       backgroundThrottling: false,
     },
   });
 
   const { session } = instautoWindow.webContents;
-  await session.clearStorageData(); // we store cookies etc separately
+  await session.clearStorageData();
 
-  const browser = { // TODO improve API in instauto to accept page instead of browser?
+  const pieBrowser = await pieConnectPromise;
+
+  const browser = {
     newPage: async () => {
-      const pieBrowser = await pieConnectPromise;
-      return pie.getPage(pieBrowser, instautoWindow);
+      const page = await pie.getPage(pieBrowser, instautoWindow);
+
+      // ── Patch page.goto: interceptar navegación a Instagram ──────────────
+      const originalGoto = page.goto.bind(page);
+      page.goto = async (url, gotoOptions) => {
+        const result = await originalGoto(url, { waitUntil: 'domcontentloaded', timeout: 60000, ...gotoOptions });
+
+        const landedUrl = page.url();
+        const isInstagram = landedUrl.includes('instagram.com');
+        const isLoginPage = landedUrl.includes('/accounts/login') ||
+          landedUrl === 'https://www.instagram.com/' ||
+          landedUrl === 'https://www.instagram.com';
+
+        if (isInstagram && isLoginPage && username && password) {
+          loggerArg && loggerArg.log('[Login] Página Instagram detectada, ejecutando login…');
+          await handleInstagramLoginPage(page, username, password);
+        }
+
+        return result;
+      };
+
+      // ── Patch page.click: instauto llama page.click() sin esperar a React ──
+      // Añadir waitForSelector automático antes de cada click.
+      const originalClick = page.click.bind(page);
+      page.click = async (selector, clickOptions) => {
+        try {
+          await page.waitForSelector(selector, { timeout: 12000, visible: true });
+        } catch (_) {
+          // Si no aparece en 12s, dejamos que el click original falle con su error original
+        }
+        return originalClick(selector, clickOptions);
+      };
+
+      // ── Patch page.type: igual que click, esperar el elemento ────────────
+      const originalType = page.type.bind(page);
+      page.type = async (selector, text, typeOptions) => {
+        try {
+          await page.waitForSelector(selector, { timeout: 12000, visible: true });
+        } catch (_) {}
+        return originalType(selector, text, typeOptions);
+      };
+
+      return page;
     },
   };
 
   const options = {
-    // Testing
-    // randomizeUserAgent: false,
-    // userAgent: 'Mozilla/5.0 (Linux; Android 9; RMX1971) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.136 Mobile Safari/537.36',
-
     userAgent,
-
     cookiesPath,
-
     username,
     password,
-
     maxFollowsPerHour,
     maxFollowsPerDay,
     maxLikesPerDay,
@@ -169,7 +308,6 @@ async function initInstauto({
     dontUnfollowUntilTimeElapsed: dontUnfollowUntilDaysElapsed * 24 * 60 * 60 * 1000,
     excludeUsers,
     dryRun,
-
     logger: loggerArg,
   };
 
@@ -188,7 +326,7 @@ function cleanupInstauto() {
     instautoWindow.destroy();
     instautoWindow = undefined;
   }
-  // TODO deinit more?
+
   instautoDb = undefined;
   instauto = undefined;
   logger = console;
@@ -200,7 +338,6 @@ async function runBotNormalMode({
   assert(instauto);
 
   function getMsUntilNextRun() {
-    // const now = moment('2018-08-26T13:00:00+02:00');
     const now = moment();
     const isAfterHour = now.hour() >= runAtHour;
     const nextRunTime = now.clone().startOf('day').add(runAtHour, 'hours');
@@ -210,18 +347,18 @@ async function runBotNormalMode({
 
   async function sleepUntilNextDay() {
     const msUntilNextRun = getMsUntilNextRun();
-    logger.log(`Sleeping ${msUntilNextRun / (60 * 60 * 1000)} hours (waiting until ${runAtHour}:00)...`);
+    logger.log(`Sleeping ${(msUntilNextRun / (60 * 60 * 1000)).toFixed(1)} hours until ${runAtHour}:00…`);
     await new Promise(resolve => setTimeout(resolve, msUntilNextRun));
-    logger.log('Done sleeping, running...');
+    logger.log('Done sleeping, running…');
   }
 
   if (!instantStart) await sleepUntilNextDay();
 
   for (;;) {
     try {
-      // Leave room for some follows too
       const unfollowLimit = Math.floor(maxFollowsTotal * (2 / 3));
       let unfollowedCount = 0;
+
       if (enableFollowUnfollow) {
         unfollowedCount = await instauto.unfollowOldFollowed({ ageInDays, limit: unfollowLimit });
         if (unfollowedCount > 0) await instauto.sleep(10 * 60 * 1000);
@@ -238,11 +375,10 @@ async function runBotNormalMode({
         likeImagesMax: likingEnabled ? maxLikesPerUser : undefined,
       });
 
-      logger.log('Done running');
-
+      logger.log('Daily run complete.');
       await instauto.sleep(30000);
     } catch (err) {
-      logger.error(err);
+      logger.error('Error during run:', err.message || err);
     }
 
     await sleepUntilNextDay();
@@ -269,72 +405,47 @@ async function runBotFollowUserList({ users, limit, skipPrivate } = {}) {
   await instauto.safelyFollowUserList({ users, limit, skipPrivate });
 }
 
-// for easier development testing
 async function runTestCode() {
-  // console.log(await instauto.doesUserFollowMe('mifi.no'));
+  // console.log(await instauto.doesUserFollowMe('someuser'));
 }
 
 function createWindow() {
-  // Create the browser window.
   mainWindow = new BrowserWindow({
-    width: 800,
-    height: 700,
+    width: 900,
+    height: 660,
+    minWidth: 750,
+    minHeight: 550,
     webPreferences: {
-      contextIsolation: false, // todo
-      nodeIntegration: true, // todo
+      contextIsolation: false,
+      nodeIntegration: true,
       preload: path.join(__dirname, 'preload.js'),
-      // https://github.com/electron/electron/issues/5107
       webSecurity: !isDev,
-      backgroundThrottling: false, // Attempt to fix https://github.com/mifi/SimpleInstaBot/issues/37
+      backgroundThrottling: false,
     },
-    title: `SimpleInstaBot ${app.getVersion()}`,
+    title: `InstaBot ${app.getVersion()}`,
+    backgroundColor: '#0d0f14',
+    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
   });
 
   electronRemote.enable(mainWindow.webContents);
 
   const url = new URL(isDev ? 'http://localhost:3001' : `file://${path.join(__dirname, '../build/index.html')}`);
-
   url.searchParams.append('data', JSON.stringify({ isDev }));
-
   mainWindow.loadURL(url.toString());
 
   if (isDev) {
-    const { default: installExtension, REACT_DEVELOPER_TOOLS } = require('electron-devtools-installer'); // eslint-disable-line global-require,import/no-extraneous-dependencies
-
+    const { default: installExtension, REACT_DEVELOPER_TOOLS } = require('electron-devtools-installer'); // eslint-disable-line
     installExtension(REACT_DEVELOPER_TOOLS)
       .then(name => console.log(`Added Extension: ${name}`))
-      .catch(err => console.log('An error occurred: ', err));
+      .catch(err => console.log('Extension error:', err));
   }
 
-  // Open the DevTools.
-  // mainWindow.webContents.openDevTools()
-
-  // Emitted when the window is closed.
-  mainWindow.on('closed', () => {
-    // Dereference the window object, usually you would store windows
-    // in an array if your app supports multi windows, this is the time
-    // when you should delete the corresponding element.
-    mainWindow = null;
-  });
+  mainWindow.on('closed', () => { mainWindow = null; });
 }
 
-// This method will be called when Electron has finished
-// initialization and is ready to create browser windows.
-// Some APIs can only be used after this event occurs.
 app.on('ready', createWindow);
-
-// Quit when all windows are closed.
-app.on('window-all-closed', () => {
-  app.quit();
-});
-
-app.on('activate', () => {
-  // On macOS it's common to re-create a window in the app when the
-  // dock icon is clicked and there are no other windows open.
-  if (mainWindow === null) {
-    createWindow();
-  }
-});
+app.on('window-all-closed', () => { app.quit(); });
+app.on('activate', () => { if (mainWindow === null) createWindow(); });
 
 module.exports = {
   initInstauto,

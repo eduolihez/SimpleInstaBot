@@ -1,0 +1,18 @@
+{
+  "extends": "react-app",
+  "rules": {
+    "linebreak-style": "off",
+    "no-multi-spaces": "off",
+    "key-spacing": "off",
+    "no-nested-ternary": "off",
+    "brace-style": "off",
+    "eol-last": "off",
+    "react/jsx-tag-spacing": "off",
+    "react/jsx-closing-tag-location": "off",
+    "react/jsx-wrap-multilines": "off",
+    "react/jsx-no-useless-fragment": "off",
+    "jsx-a11y/no-static-element-interactions": "off",
+    "jsx-a11y/label-has-associated-control": "off",
+    "jsx-a11y/click-events-have-key-events": "off"
+  }
+}

@@ -29,7 +29,7 @@
     "yargs-parser": "^21.0.1"
   },
   "scripts": {
-    "start:frontend": "BROWSER=none PORT=3001 react-scripts start",
+    "start:frontend": "cross-env BROWSER=none PORT=3001 react-scripts start",
     "start:electron": "wait-on http://localhost:3001 && electron .",
     "start": "concurrently -k \"npm run start:frontend\" \"npm run start:electron\"",
     "icon-gen": "mkdirp icon-build && node scripts/icon-gen.mjs",
@@ -58,6 +58,7 @@
   },
   "devDependencies": {
     "concurrently": "^4.1.0",
+    "cross-env": "^10.1.0",
     "electron": "^19.1.8",
     "electron-builder": "^23.1.0",
     "electron-builder-notarize": "^1.5.0",
